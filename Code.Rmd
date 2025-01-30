@@ -1,0 +1,367 @@
+---
+title: "Abda Group-15"
+author: "Islam, Emon, Montasir "
+date: "2024-02-27"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+Load required Package
+```{r}
+
+library(dplyr)
+library(brms)
+library(synthpop)
+library(corrplot)
+library(loo)
+library(caret)
+library(e1071)
+library(bayesplot)
+library(gridExtra)
+```
+
+
+
+Load original dataset
+````{r}
+og_data<- read.csv("cirrhosis.csv")
+head(og_data)
+````
+
+Synyhethic data generation
+
+```{r}
+myseed<-1285
+synthetic_data<-syn(og_data, method = "cart", visit.sequence = (1:ncol(og_data)), m=1, k=5000,seed = myseed)
+synthethic_data<-as.data.frame(synthetic_data$syn)
+head(synthethic_data)
+```
+Synthetic data evalutaion 
+
+```{r}
+create_unique_values_table <- function(data) {
+  table <- data.frame(Features = character(), Unique_Values = numeric(), Mean = numeric(), Skewness = numeric(), Kurtosis = numeric(), Max_Category = character(), stringsAsFactors = TRUE)
+  for (col in colnames(data)) {
+    if (is.numeric(data[[col]])) {
+      n_unique <- length(unique(data[[col]]))
+      mean_val <- mean(data[[col]], na.rm = TRUE)
+      skew_val <- skewness(data[[col]], na.rm = TRUE)
+      kurt_val <- kurtosis(data[[col]], na.rm = TRUE)
+      max_category <- NA
+    } else {
+      n_unique <- length(unique(data[[col]]))
+      mean_val <- NA
+      skew_val <- NA
+      kurt_val <- NA
+      max_category <- names(sort(table(data[[col]]), decreasing = TRUE)[1])
+    }
+    table <- rbind(table, data.frame(Features = col, Unique_Values = n_unique, Mean = mean_val, Skewness = skew_val, Kurtosis = kurt_val, Max_Category = max_category))
+  }
+  return(table)
+}
+
+original_table <- create_unique_values_table(og_data)
+synthetic_table <- create_unique_values_table(synthethic_data)
+
+og_unique <- original_table$Unique_Values
+og_mean <- original_table$Mean
+og_skew <- original_table$Skewness
+og_kurt <- original_table$Kurtosis
+og_max <- original_table$Max_Category
+
+syn_unique <- synthetic_table$Unique_Values
+syn_mean <- synthetic_table$Mean
+syn_skew <- synthetic_table$Skewness
+syn_kurt <- synthetic_table$Kurtosis
+syn_max <- synthetic_table$Max_Category
+
+feature <- original_table$Features
+
+comparison_df <- data.frame(
+  Feature = feature,
+  Original_Unique_Values = og_unique,
+  Synthetic_Unique_Values = syn_unique,
+  Original_Mean = og_mean,
+  Synthetic_Mean = syn_mean,
+  Original_Skewness = og_skew,
+  Synthetic_Skewness = syn_skew,
+  Original_Kurtosis = og_kurt,
+  Synthetic_Kurtosis = syn_kurt,
+  Original_Max_Category = og_max,
+  Synthetic_Max_Category = syn_max
+)
+
+print(comparison_df)
+
+```
+
+
+Now we wiil consider synthetic data as main and wiil try to gain insights about the feature on this data, and then we will perform train and test split and evaluate model on the test data.
+
+
+Now we have to pre-process  data(One hot encoding of categorical variable and some new feature generation)
+
+
+```{r}
+og_data <- og_data %>%
+  mutate(Status = recode(Status, "D" = 1, "C" = 0, "CL" = 2),
+         Status = as.numeric(Status))
+# ONE HOT ENCODING OF CATAGORICAL VARIABLE
+og_data$Age <- og_data$Age /365.25
+og_data$Sex <- as.integer(og_data$Sex == "M")
+og_data$Drug <- as.integer(og_data$Drug == "D-penicillamine")
+og_data$Edema <- as.integer(og_data$Edema == 'Y')
+og_data <- subset(og_data, select = -ID)
+og_data <- og_data[order(og_data$Drug), ]
+og_data$Ascites <- as.integer(og_data$Ascites == 'Y')
+og_data$Spiders <- as.integer(og_data$Spiders == 'Y')
+og_data$Hepatomegaly <- as.integer(og_data$Hepatomegaly == 'Y')
+head(og_data)
+
+#feature generation
+og_data<-na.omit(og_data)
+og_data$Age <- round(og_data$Age)
+threshold_platelets <- 150
+og_data$thrombocytopenia <- ifelse(og_data$Platelets < threshold_platelets, 1, 0)
+threshold_alk_phos_upper <- 147  # Upper limit of normal range
+threshold_alk_phos_lower <- 44   # Lower limit of normal range
+og_data$elevated_alk_phos <- ifelse(og_data$Alk_Phos > threshold_alk_phos_upper | og_data$Alk_Phos < threshold_alk_phos_lower, 1, 0)
+normal_copper_range <- c(62, 140)
+og_data$normal_copper <- ifelse(og_data$Copper >= normal_copper_range[1] & og_data$Copper <= normal_copper_range[2], 1, 0)
+normal_albumin_range <- c(3.4, 5.4)
+og_data$normal_albumin <- ifelse(og_data$Albumin >= normal_albumin_range[1] & og_data$Albumin <= normal_albumin_range[2], 1, 0)
+og_data$DiagnosisDays <- og_data$Age - og_data$N_Days
+og_data$Age_Group <- cut(og_data$Age, breaks = c(19, 29, 49, 64, 99), labels = c(0, 1, 2, 3))
+og_data$Age_Group <- as.integer(as.character(og_data$Age_Group))
+og_data$Symptom_Score <- rowSums(og_data[, c("Ascites", "Hepatomegaly", "Spiders")])
+og_data$Liver_Function_Index <- rowMeans(og_data[, c("Bilirubin", "Albumin", "Alk_Phos", "SGOT")])
+og_data$Bilirubin_Albumin<-og_data$Bilirubin * og_data$Albumin
+og_data$Risk_Score <- og_data$Bilirubin + og_data$Albumin - og_data$Alk_Phos
+og_data$Diag_Month <- as.integer((og_data$N_Days %% 365) / 30)
+og_data$Diag_Year <- as.integer(og_data$N_Days / 365)
+og_data$N_Days <- og_data$N_Days / 365.25
+head(og_data)
+```
+
+
+Explanatory Analysis(Distribution for each class)
+
+```{r}
+library(ggplot2)
+numeric_cols <- c('N_Days', 'Age', 'Bilirubin', 'Cholesterol', 'Albumin', 'Copper',
+                  'Alk_Phos', 'SGOT', 'Tryglicerides', 'Platelets', 'Prothrombin',
+                  'Risk_Score', 'Liver_Function_Index', 'DiagnosisDays', 'Bilirubin_Albumin',
+                  'Diag_Year', 'Diag_Month')
+
+train_to_scale <- og_data[, numeric_cols]
+ultra_light_colors <- c("#F0F8FF", "#F6F6F6", "#F0FFF0", "#FAFAD2", "#FFE4E1", 
+                        "#FFF5EE", "#F5FFFA", "#F0FFFF", "#FFFAF0", "#F8F8FF")
+
+col_per_class <- function(og_data, col) {
+  ggplot(og_data, aes(x = factor(Status), y = .data[[col]], fill = factor(Status))) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white", color = "black") +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "black") +
+    labs(title = paste("Distribution for", col, "for each class")) +
+    scale_fill_manual(values = ultra_light_colors) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+plots <- lapply(numeric_cols, function(col) col_per_class(og_data, col))
+plots
+```
+According to the similarity , we have come to know that C and Cl are close enough. so we decide to merge c=0, cl=2 to 0 so that we will have 2 categories from which we will make predictions.
+
+```{r}
+og_data <- og_data %>%
+  mutate(Status = recode(Status,"0"="0", "1" = "1", "2" = "0"))
+```
+
+
+Standerdization(to make all feature in same scale)
+  
+
+```{r}
+threshold <- 5
+group_variables <- names(og_data)[sapply(og_data, function(x) length(unique(x))) < threshold]
+og_data[group_variables] <- lapply(og_data[group_variables], factor)
+og_data$elevated_alk_phos<- as.numeric(og_data$elevated_alk_phos)
+non_group_variables <- setdiff(colnames(og_data), group_variables)
+og_data[non_group_variables] <- scale(og_data[non_group_variables])
+```
+
+
+Check the correlation matrix and exclude the highly correlated variable to tackle the over fitting tendency
+
+
+```{r}
+correlation_matrix <- cor(og_data[non_group_variables], use = "pairwise.complete.obs")
+corrplot(correlation_matrix, method = "color", type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+
+
+
+Columns to drop due to correlation
+```{r}
+columns_to_drop <- c('DiagnosisDays', 'Bilirubin_Albumin','Diag_Year', 'Risk_Score', 'Liver_Function_Index')
+og_data <- og_data[, !names(og_data) %in% columns_to_drop]
+```
+
+
+Our final data set
+
+```{r}
+head(og_data)
+```
+
+Train and Test split of final dataset
+```{r}
+
+set.seed(12348)
+index <- createDataPartition(og_data$Status, p = 0.7, list = FALSE)
+train_data <- og_data[index, ]
+test_data <- og_data[-index, ]
+```
+
+
+Fit Bayesian logistic regression model with all features and considering group level effects(mega_model)
+
+```{r}
+Model1 <- brm(Status ~ . + (1|Age_Group) + (1|Stage) + (1| Symptom_Score),
+            data = train_data, 
+            family = bernoulli(link = "logit"),
+            prior = c(set_prior("student_t(4, 1, 2)", class = "b"), 
+                      set_prior("normal(-0.5,0.25)", coef = "Drug1", class = "b")),
+            control = list(adapt_delta = 0.98),
+            iter = 4000, warmup = 2000)
+
+
+```
+```{r}
+summary(Model1)
+```
+
+Now same model with different prior (*prior sensitivity analysis)
+
+```{r}
+Model2 <- brm(Status ~ . + (1|Age_Group) + (1|Stage) + (1| Symptom_Score),
+            data = train_data, 
+            family = bernoulli(link = "logit"),
+            prior = set_prior("student_t(3, 0, 2)", class = "b"),
+            control = list(adapt_delta = 0.98),
+            iter = 4000, warmup = 2000)
+
+
+```
+
+```{r}
+summary(Model2)
+```
+Now fit different model on the synthetic data without considering group effect but considering the first prior
+
+```{r}
+Model3 <- brm(Status ~ ., 
+            data = train_data, 
+            family = bernoulli(link = "logit"),
+            prior = c(set_prior("student_t(4, 1, 2)", class = "b"), 
+                      set_prior("normal(-0.5, 0.25)", coef = "Drug1", class = "b")))
+
+
+```
+
+
+```{r}
+summary(Model3)
+```
+Comparing the 3 models using loo function 
+```{r}
+loo(Model1,Model2,Model3)
+```
+
+
+
+
+Model diagnostics(mcmc_trace evaluation)
+```{r}
+
+mcmc_plot(Model1, type = "trace")
+mcmc_plot(Model2, type = "trace")
+mcmc_plot(Model3, type = "trace")
+
+
+```
+
+
+Model evaluation on the test split(prior sentivity analysis and sensitivity)
+
+```{r}
+test_predictions <- predict(Model1, newdata = test_data, type = "response")
+predicted_classes <- ifelse(test_predictions > 0.5, 1, 0)
+predicted_classes_Model1<-as.data.frame(predicted_classes)
+conf_matrix <- table(predicted_classes_Model1$Estimate, test_data$Status)
+
+TP <- conf_matrix[2, 2]
+FP <- conf_matrix[1, 2]
+TN <- conf_matrix[1, 1]
+FN <- conf_matrix[2, 1]
+
+specificity <- TN / (TN + FP)
+sensitivity <- TP / (TP + FN)
+test_predictions_Model2 <- predict(Model2, newdata = test_data, type = "response")
+predicted_classes_Model2 <- ifelse(test_predictions_Model2 > 0.5, 1, 0)
+predicted_classes_Model2<-as.data.frame(predicted_classes)
+conf_matrix_Model2 <- table(predicted_classes_Model2$Estimate, test_data$Status)
+
+TP_Model2 <- conf_matrix_Model2[2, 2]
+FP_Model2 <- conf_matrix_Model2[1, 2]
+TN_Model2 <- conf_matrix_Model2[1, 1]
+FN_Model2 <- conf_matrix_Model2[2, 1]
+
+specificity_Model2 <- TN_Model2 / (TN_Model2 + FP_Model2)
+sensitivity_Model2 <- TP_Model2 / (TP_Model2 + FN_Model2)
+comparison_results <- data.frame(Model = c("Model1", "Model2"),
+                                 Specificity = c(specificity, specificity_Model2),
+                                 Sensitivity = c(sensitivity, sensitivity_Model2))
+print(comparison_results)
+```
+
+Stan Code for each of the models
+
+```{r}
+
+stancode(Model1)
+
+
+
+```
+```{r}
+
+stancode(Model2)
+
+```
+```{r}
+stancode(Model3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
